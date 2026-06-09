@@ -18,18 +18,58 @@ try:
 except ImportError:
     urllib = None
 
-DOMAIN_FILE = "domains.txt"
+import os
+import re
+import sys
+import shutil
+import socket
+import platform
+import time
+import json
+import ssl
+import subprocess
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, TimeoutError as FuturesTimeoutError
+try:
+    import urllib.request
+except ImportError:
+    urllib = None
 
-# 公共 DNS 服务器列表（国内优先）
+# DOMAIN_FILE 使用脚本所在目录，避免相对路径问题
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+DOMAIN_FILE = os.path.join(_SCRIPT_DIR, "domains.txt")
+
+# 公共 DNS 服务器列表
 PUBLIC_DNS = [
-    ('223.5.5.5', '阿里云'),
-    ('223.6.6.6', '阿里云'),
-    ('119.29.29.29', '腾讯云'),
-    ('182.254.118.118', '腾讯云'),
-    ('114.114.114.114', '腾讯'),
-    ('8.8.8.8', 'Google'),
-    ('1.1.1.1', 'Cloudflare'),
+    ('223.5.5.5', '阿里云DNS'),
+    ('119.29.29.29', '腾讯云DNS'),
+    ('180.76.76.76', '百度DNS'),
+    ('1.2.4.8', 'CNNIC DNS'),
+    ('1.1.1.1', 'CloudflareDNS'),
+    ('9.9.9.9', 'Quad9'),
+    ('8.8.8.8', 'GoogleDNS'),
 ]
+
+# DNS 全局并发超时（秒），控制 compare_dns_all 等并发查询的总等待时间
+DNS_GLOBAL_TIMEOUT = 15
+
+# DNS 查询参数
+DNS_TIMEOUT = 3
+DNS_LIFETIME = 5
+
+# 私有 IP / CDN IP 段（模块级函数，供多处复用）
+PRIVATE_IP_PREFIXES = (
+    '10.', '172.16.', '172.17.', '172.18.', '172.19.',
+    '172.20.', '172.21.', '172.22.', '172.23.', '172.24.',
+    '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
+    '172.30.', '172.31.', '192.168.', '127.', '0.',
+    '198.18.', '198.19.', '169.254.', '224.', '240.',
+)
+
+
+def is_private_cdn_ip(ip: str) -> bool:
+    """判断是否为私有 IP 或已知 CDN IP 段"""
+    return ip.startswith(PRIVATE_IP_PREFIXES)
 
 # 可用 DNS 模块
 DNS_AVAILABLE = False
@@ -82,10 +122,9 @@ def check_environment():
 
     # 系统命令
     if system in ('Linux', 'Darwin'):
-        import shutil as shutil_mod
-        if not shutil_mod.which('whois'):
+        if not shutil.which('whois'):
             missing_cmds.append('whois')
-        if not shutil_mod.which('openssl'):
+        if not shutil.which('openssl'):
             missing_cmds.append('openssl')
 
     # 颜色模块（可选，有就更好）
@@ -124,10 +163,7 @@ def get_ip_info(ip: str) -> dict:
         return result
 
     # 跳过私有 IP
-    if ip.startswith(('10.', '172.16.', '172.17.', '172.18.', '172.19.',
-                      '172.20.', '172.21.', '172.22.', '172.23.', '172.24.',
-                      '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
-                      '172.30.', '172.31.', '192.168.', '127.', '0.', '198.18.', '198.19.')):
+    if is_private_cdn_ip(ip):
         result['error'] = '保留/私有 IP (CDN/内网)'
         return result
 
@@ -137,6 +173,7 @@ def get_ip_info(ip: str) -> dict:
     ]
 
     for api_name, api_url in apis:
+        result['error'] = None  # 每次重试前清掉上一次的错误
         try:
             url = api_url.format(ip=ip)
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -168,10 +205,12 @@ def get_ip_info(ip: str) -> dict:
 
             if result['country'] or result['isp']:
                 return result
-        except Exception:
+        except Exception as exc:
+            result['error'] = f'查询异常: {exc}'
             continue
 
-    result['error'] = '查询失败 (可能超出API限制)'
+    if result['error'] is None:
+        result['error'] = '查询失败 (可能超出API限制)'
     return result
 
 
@@ -187,20 +226,17 @@ def get_whois(domain: str) -> dict:
         'error': None
     }
 
+    # python-whois 库优先（跨平台）
+    WHOIS_AVAILABLE = False
     try:
-        if platform.system() == 'Darwin' or platform.system() == 'Linux':
-            # macOS/Linux 用系统 whois 命令
-            proc = subprocess.run(['whois', domain], capture_output=True, text=True, timeout=10)
-            output = proc.stdout
-        else:
-            result['error'] = 'WHOIS 仅支持 macOS/Linux'
-            return result
+        import whois
+        WHOIS_AVAILABLE = True
+    except ImportError:
+        pass
 
-        if not output:
-            result['error'] = 'WHOIS 查询无结果'
-            return result
-
-        # 解析关键字段
+    def _parse_whois_text(output: str):
+        """解析 whois 文本输出，填充 result"""
+        nonlocal result
         for line in output.split('\n'):
             line = line.strip()
             if ':' in line:
@@ -224,20 +260,57 @@ def get_whois(domain: str) -> dict:
                         result['status'] = val
 
         if not result['registrar'] and not result['registration_date']:
-            # 尝试原始输出匹配
             if 'No match' in output or 'NOT FOUND' in output:
                 result['error'] = '域名未注册或不可用'
             elif 'Domain Name:' in output:
-                # 另一种格式
                 for line in output.split('\n'):
                     if line.startswith('Domain Name:'):
                         result['registrar'] = line.split(':', 1)[1].strip()
                         break
 
+    try:
+        if WHOIS_AVAILABLE:
+            # 方法1: python-whois 库（跨平台，优先）
+            w = whois.query(domain)
+            if w:
+                result['registrar'] = w.registrar
+                result['registration_date'] = str(w.creation_date) if w.creation_date else None
+                result['expiration_date'] = str(w.expiration_date) if w.expiration_date else None
+                result['name_servers'] = list(w.name_servers) if w.name_servers else []
+                result['status'] = w.status[0] if w.status else None
+            else:
+                result['error'] = '域名未注册或不可用'
+            return result
+
+        if platform.system() in ('Darwin', 'Linux'):
+            # 方法2: 系统 whois 命令（macOS/Linux）
+            proc = subprocess.run(['whois', domain], capture_output=True, text=True, timeout=10)
+            output = proc.stdout
+        else:
+            # Windows 无系统 whois，尝试用 whois-rdap 库
+            try:
+                import whois as whois_rdap
+                w = whois_rdap.query(domain)
+                if w:
+                    result['registrar'] = getattr(w, 'registrar', None)
+                    result['registration_date'] = str(getattr(w, 'creation_date', None))
+                    result['expiration_date'] = str(getattr(w, 'expiration_date', None))
+                    result['name_servers'] = list(getattr(w, 'name_servers', []) or [])
+                return result
+            except ImportError:
+                result['error'] = 'WHOIS 查询失败 (系统不支持，且未安装 python-whois 库)'
+                return result
+
+        if not output:
+            result['error'] = 'WHOIS 查询无结果'
+            return result
+
+        _parse_whois_text(output)
+
     except subprocess.TimeoutExpired:
         result['error'] = 'WHOIS 查询超时'
     except FileNotFoundError:
-        result['error'] = '系统未安装 whois 命令 (macOS: brew install whois)'
+        result['error'] = '系统未安装 whois 命令 (macOS: brew install whois; Linux: apt install whois)'
     except Exception as e:
         result['error'] = f'WHOIS 查询异常: {e}'
 
@@ -382,12 +455,15 @@ def resolve_with_dns(domain: str, dns_server: str = None) -> dict:
         return result
 
     resolver = dns.resolver.Resolver()
-    resolver.timeout = 3
-    resolver.lifetime = 5
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_LIFETIME
 
     start_time = time.time()
 
+    nxdomain_occurred = False
+
     def query_record(record_type: str):
+        nonlocal nxdomain_occurred
         try:
             answers = resolver.resolve(domain, record_type)
             records = []
@@ -416,7 +492,7 @@ def resolve_with_dns(domain: str, dns_server: str = None) -> dict:
         except dns.resolver.NoAnswer:
             return None, None
         except dns.resolver.NXDOMAIN:
-            result['errors'].append('域名不存在 (NXDOMAIN)')
+            nxdomain_occurred = True
             return None, None
         except dns.exception.Timeout:
             return None, None
@@ -443,12 +519,16 @@ def resolve_with_dns(domain: str, dns_server: str = None) -> dict:
                     if ttl:
                         result['ttl'][rtype] = ttl
 
-            if result['records'] or result['errors']:
+            if result['records'] or result['errors'] or nxdomain_occurred:
                 result['dns_server'] = f"{dns_ip} ({dns_name})"
                 break
 
-        if not result['records'] and not result['errors']:
+        if not result['records'] and not result['errors'] and not nxdomain_occurred:
             result['errors'].append('所有公共 DNS 均解析失败')
+
+    # NXDOMAIN 单独处理，不影响其他记录类型查询
+    if nxdomain_occurred and not result['records']:
+        result['errors'].insert(0, '域名不存在 (NXDOMAIN)')
 
     result['response_time'] = round((time.time() - start_time) * 1000, 2)
 
@@ -457,14 +537,6 @@ def resolve_with_dns(domain: str, dns_server: str = None) -> dict:
         ipv4 = result['records']['A'][0]
         ip_info = get_ip_info(ipv4)
         result['ip_info'] = ip_info
-
-    # 检测是否为 CDN/私有 IP
-    def is_private_cdn_ip(ip: str) -> bool:
-        return ip.startswith(('10.', '172.16.', '172.17.', '172.18.', '172.19.',
-                              '172.20.', '172.21.', '172.22.', '172.23.', '172.24.',
-                              '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
-                              '172.30.', '172.31.', '192.168.', '127.', '0.',
-                              '198.18.', '198.19.', '169.254.', '224.', '240.'))
 
     # 端口检测
     if 'A' in result['records'] and result['records']['A']:
@@ -496,18 +568,32 @@ def compare_dns_all(domain: str) -> list:
         try:
             resolver = dns.resolver.Resolver()
             resolver.nameservers = [dns_ip]
-            resolver.timeout = 3
-            resolver.lifetime = 5
+            resolver.timeout = DNS_TIMEOUT
+            resolver.lifetime = DNS_LIFETIME
             a_records = resolver.resolve(domain, 'A')
             ips = [rdata.address for rdata in a_records]
             return {'dns': f"{dns_ip} ({dns_name})", 'ips': sorted(ips), 'success': True}
         except Exception as e:
             return {'dns': f"{dns_ip} ({dns_name})", 'ips': [], 'success': False, 'error': str(e)}
 
-    with ThreadPoolExecutor(max_workers=7) as executor:
+    with ThreadPoolExecutor(max_workers=len(PUBLIC_DNS)) as executor:
         futures = {executor.submit(query_with_dns, ip, name): (ip, name) for ip, name in PUBLIC_DNS}
-        for future in as_completed(futures):
+        # 全局超时兜底：整体等待 DNS_GLOBAL_TIMEOUT 秒，不再苦等某个慢查询
+        done, not_done = set(), set()
+        try:
+            done, not_done = wait(futures, timeout=DNS_GLOBAL_TIMEOUT)
+        except FuturesTimeoutError:
+            pass
+        for future in done:
             results.append(future.result())
+        for future in not_done:
+            future.cancel()
+            results.append({
+                'dns': f"{futures[future][0]} ({futures[future][1]})",
+                'ips': [],
+                'success': False,
+                'error': f'全局超时 (>{DNS_GLOBAL_TIMEOUT}s)',
+            })
 
     return results
 
@@ -647,6 +733,23 @@ def display_ssl(result: dict):
         print(f"  {c['label']}%-12s{c['value']} %s" % ('加密套件:', result['cipher']))
 
 
+def _clean_dns_error(raw_error: str) -> str:
+    """将 dnspython 原始错误信息转换为用户友好的提示"""
+    raw = raw_error.lower()
+    if 'timeout' in raw or 'timed out' in raw or 'lifetime expired' in raw:
+        return 'DNS 查询超时'
+    if 'nxdomain' in raw or '域名不存在' in raw:
+        return '域名不存在'
+    if 'no answer' in raw:
+        return '无 DNS 记录'
+    if 'refused' in raw:
+        return 'DNS 查询被拒绝'
+    #通用：截断过长的协议级错误描述
+    if len(raw_error) > 60:
+        return raw_error[:60] + '...'
+    return raw_error
+
+
 def display_dns_compare(results: list):
     """显示多 DNS 对比结果"""
     c = COLORS
@@ -660,17 +763,19 @@ def display_dns_compare(results: list):
         for r in success_results:
             print(f"  {c['dim']}%-15s {c['value']}%s" % (r['dns'] + ':', ', '.join(r['ips']) if r['ips'] else '无A记录'))
 
-        # 检查是否所有 DNS 返回相同 IP
-        all_ips = [tuple(r['ips']) for r in success_results if r['ips']]
-        if len(set(all_ips)) == 1:
+        # 按返回 IP 分组，CDN 多节点返回不同 IP 是正常行为
+        all_ips = [tuple(sorted(r['ips'])) for r in success_results if r['ips']]
+        unique_results = len(set(all_ips))
+        if unique_results == 1:
             print(f"  {c['success']}✓ 所有DNS返回一致")
         else:
-            print(f"  {c['warning']}⚠ DNS返回不一致!")
+            print(f"  {c['dim']}  检测到 {unique_results} 组不同来源 IP (CDN 多节点负载均衡为正常现象)")
 
     if failed_results:
         print(f"  {c['error']}失败: {len(failed_results)}/{len(results)}")
         for r in failed_results:
-            print(f"  {c['dim']}%-15s {r['error'] or '查询失败'}" % (r['dns'] + ':'))
+            clean_err = _clean_dns_error(r.get('error', '查询失败'))
+            print(f"  {c['dim']}%-15s {clean_err}" % (r['dns'] + ':'))
 
 
 def resolve_interactive():
