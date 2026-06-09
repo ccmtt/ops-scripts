@@ -51,11 +51,11 @@ PUBLIC_DNS = [
 ]
 
 # DNS 全局并发超时（秒），控制 compare_dns_all 等并发查询的总等待时间
-DNS_GLOBAL_TIMEOUT = 15
+DNS_GLOBAL_TIMEOUT = 10
 
 # DNS 查询参数
-DNS_TIMEOUT = 3
-DNS_LIFETIME = 5
+DNS_TIMEOUT = 2      # 单次查询超时（秒）
+DNS_LIFETIME = 4       # 总生命周期（秒）
 
 # 私有 IP / CDN IP 段（模块级函数，供多处复用）
 PRIVATE_IP_PREFIXES = (
