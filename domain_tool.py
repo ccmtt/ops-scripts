@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
 """域名管理工具 - 跨平台通用 (Linux/macOS/Windows)"""
 
-import os
-import re
-import sys
-import shutil
-import socket
-import platform
-import time
-import json
-import ssl
-import subprocess
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-try:
-    import urllib.request
-except ImportError:
-    urllib = None
-
-import os
-import re
-import sys
-import shutil
-import socket
-import platform
-import time
-import json
-import ssl
-import subprocess
+import os              # 文件系统操作（路径处理、文件读写、目录管理）
+import re              # 正则表达式处理（域名格式验证、IP匹配）
+import sys             # 系统级操作（命令行参数、标准输出、退出码）
+import shutil          # 高级文件操作（复制、移动、删除文件/目录）
+import socket          # 网络通信（DNS解析、IP地址查询、端口检测）
+import platform        # 操作系统信息检测（跨平台兼容处理）
+import time            # 时间操作（延时、时间戳、计时）
+import json            # JSON数据序列化与反序列化
+import ssl             # SSL/TLS加密通信（HTTPS证书验证）
+import subprocess      # 子进程执行（调用系统命令如dig、nslookup）
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, TimeoutError as FuturesTimeoutError
 try:
