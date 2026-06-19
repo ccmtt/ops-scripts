@@ -1,4 +1,5 @@
 AGENTS.md
+.DS_Store
 
 # Python
 __pycache__/
@@ -14,4 +15,6 @@ frontend/dist/
 *.tsbuildinfo
 
 # Runtime data
+backend/data/capture_tasks.jsonl
+backend/data/operation_logs.jsonl
 backend/data/captures/*.pcap

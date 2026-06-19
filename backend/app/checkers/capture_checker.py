@@ -222,3 +222,60 @@ def run_short_capture(
         "returncode": proc.returncode,
         "stderr": stderr,
     }
+
+
+def check_capture_permission(interface: Optional[str] = None) -> Dict[str, Any]:
+    env = get_capture_environment()
+    tcpdump = env["tools"]["tcpdump"]
+    if not tcpdump.get("available") or not tcpdump.get("path"):
+        return {
+            "interface": interface,
+            "can_capture": False,
+            "status": "missing-tcpdump",
+            "error": "未检测到 tcpdump。",
+            "command": [],
+        }
+
+    selected_interface = interface
+    if not selected_interface:
+        for item in env.get("interfaces", []):
+            flags = set(item.get("flags", []))
+            if "Up" in flags and item.get("name") != "lo0":
+                selected_interface = item.get("name")
+                break
+        if not selected_interface and env.get("interfaces"):
+            selected_interface = env["interfaces"][0]["name"]
+
+    if not selected_interface:
+        return {
+            "interface": None,
+            "can_capture": False,
+            "status": "missing-interface",
+            "error": "未发现可用网卡。",
+            "command": [],
+        }
+
+    command = [tcpdump["path"], "-i", selected_interface, "-c", "1", "-w", "/dev/null"]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=3)
+    except subprocess.TimeoutExpired:
+        return {
+            "interface": selected_interface,
+            "can_capture": True,
+            "status": "capture-started",
+            "command": command,
+            "error": None,
+        }
+
+    stderr = proc.stderr.strip()
+    can_capture = proc.returncode == 0
+    status = "ok" if can_capture else "permission-denied"
+    error = None if can_capture else stderr or "抓包权限检查失败。"
+    return {
+        "interface": selected_interface,
+        "can_capture": can_capture,
+        "status": status,
+        "error": error,
+        "command": command,
+        "returncode": proc.returncode,
+    }

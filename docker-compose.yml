@@ -4,8 +4,12 @@ services:
   backend:
     build:
       context: ./backend
+    environment:
+      CAPTURE_AGENT_URL: http://capture-agent:9000
     ports:
       - "8000:8000"
+    depends_on:
+      - capture-agent
 
   frontend:
     build:
@@ -14,3 +18,13 @@ services:
       - "5173:80"
     depends_on:
       - backend
+
+  capture-agent:
+    build:
+      context: .
+      dockerfile: ./agents/capture/Dockerfile
+    ports:
+      - "9000:9000"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN

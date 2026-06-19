@@ -46,6 +46,44 @@ interface CaptureRunResult {
   stderr?: string | null;
 }
 
+interface CaptureTask {
+  id: string;
+  status: string;
+  interface: string;
+  bpf_filter?: string | null;
+  duration_seconds: number;
+  packet_count_limit: number;
+  captured_packet_count: number;
+  pcap_path?: string | null;
+  summary_lines: string[];
+  command: string[];
+  error?: string | null;
+  stderr?: string | null;
+  source?: string | null;
+  created_at: string;
+  started_at: string;
+  finished_at: string;
+}
+
+interface CaptureFile {
+  id: string;
+  filename: string;
+  path: string;
+  size_bytes: number;
+  created_at: string;
+  modified_at: string;
+}
+
+interface OperationLog {
+  id: string;
+  timestamp: string;
+  module: string;
+  action: string;
+  status: string;
+  message: string;
+  metadata: Record<string, unknown>;
+}
+
 interface ModuleDetailProps {
   module: ToolModule;
   onBack: () => void;
@@ -223,6 +261,10 @@ function CaptureTool() {
   const [durationSeconds, setDurationSeconds] = useState("5");
   const [packetCount, setPacketCount] = useState("50");
   const [captureResult, setCaptureResult] = useState<CaptureRunResult | null>(null);
+  const [captureTask, setCaptureTask] = useState<CaptureTask | null>(null);
+  const [tasks, setTasks] = useState<CaptureTask[]>([]);
+  const [files, setFiles] = useState<CaptureFile[]>([]);
+  const [logs, setLogs] = useState<OperationLog[]>([]);
 
   async function loadEnvironment() {
     setLoading(true);
@@ -231,32 +273,76 @@ function CaptureTool() {
       const data: CaptureEnvironment = await response.json();
       setEnvironment(data);
       setSelectedInterface((current) => current || data.interfaces.find((item) => item.name === "en0")?.name || data.interfaces[0]?.name || "");
+      await loadLogs();
     } finally {
       setLoading(false);
     }
   }
 
-  async function runCapture() {
+  async function createTask() {
     if (!selectedInterface) {
       return;
     }
     setCaptureLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/tools/capture/run`, {
+      const payload = {
+        interface: selectedInterface,
+        bpf_filter: bpfFilter.trim() || null,
+        duration_seconds: Number.parseInt(durationSeconds, 10) || 5,
+        packet_count: Number.parseInt(packetCount, 10) || 50,
+      };
+      const response = await fetch(`${API_BASE}/tools/capture/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          interface: selectedInterface,
-          bpf_filter: bpfFilter.trim() || null,
-          duration_seconds: Number.parseInt(durationSeconds, 10) || 5,
-          packet_count: Number.parseInt(packetCount, 10) || 50,
-        }),
+        body: JSON.stringify(payload),
       });
-      const data: CaptureRunResult = await response.json();
-      setCaptureResult(data);
+      const data: CaptureTask = await response.json();
+      setCaptureTask(data);
+      setCaptureResult({
+        status: data.status === "success" ? "success" : "error",
+        interface: data.interface,
+        bpf_filter: data.bpf_filter,
+        pcap_path: data.pcap_path,
+        packet_count: data.captured_packet_count,
+        summary_lines: data.summary_lines,
+        command: data.command,
+        error: data.error,
+        stderr: data.stderr,
+      });
+      await loadTasks();
+      await loadFiles();
+      await loadLogs();
     } finally {
       setCaptureLoading(false);
     }
+  }
+
+  async function loadTasks() {
+    const response = await fetch(`${API_BASE}/tools/capture/tasks?limit=10`);
+    const data: CaptureTask[] = await response.json();
+    setTasks(data);
+    await loadLogs();
+  }
+
+  async function loadFiles() {
+    const response = await fetch(`${API_BASE}/tools/capture/files`);
+    const data: CaptureFile[] = await response.json();
+    setFiles(data);
+    await loadLogs();
+  }
+
+  async function deleteFile(fileId: string) {
+    await fetch(`${API_BASE}/tools/capture/files/${encodeURIComponent(fileId)}`, {
+      method: "DELETE",
+    });
+    await loadFiles();
+    await loadLogs();
+  }
+
+  async function loadLogs() {
+    const response = await fetch(`${API_BASE}/operation-logs?module=capture&limit=20`);
+    const data: OperationLog[] = await response.json();
+    setLogs(data);
   }
 
   return (
@@ -265,6 +351,9 @@ function CaptureTool() {
         <button onClick={loadEnvironment} disabled={loading}>
           {loading ? "检查中..." : "检查抓包环境"}
         </button>
+        <button onClick={loadTasks}>刷新任务</button>
+        <button onClick={loadFiles}>刷新文件</button>
+        <button onClick={loadLogs}>刷新日志</button>
       </div>
 
       {environment ? (
@@ -366,7 +455,7 @@ function CaptureTool() {
                 <span>包数上限</span>
                 <input value={packetCount} onChange={(event) => setPacketCount(event.target.value)} />
               </label>
-              <button onClick={runCapture} disabled={captureLoading || !environment.ready_for_capture}>
+              <button onClick={createTask} disabled={captureLoading || !environment.ready_for_capture}>
                 {captureLoading ? "抓包中..." : "开始短时抓包"}
               </button>
             </div>
@@ -384,6 +473,10 @@ function CaptureTool() {
                 </span>
               </div>
               <div className="kv-grid">
+                <div className="kv">
+                  <span>任务 ID</span>
+                  <strong>{captureTask?.id || "-"}</strong>
+                </div>
                 <div className="kv">
                   <span>网卡</span>
                   <strong>{captureResult.interface}</strong>
@@ -407,6 +500,72 @@ function CaptureTool() {
               </details>
             </div>
           ) : null}
+
+          <div className="result-section">
+            <div className="result-section__head">
+              <h4>最近抓包任务</h4>
+              <span className="status-pill">{tasks.length}</span>
+            </div>
+            {tasks.length ? (
+              <div className="task-table">
+                {tasks.map((task) => (
+                  <div className="task-row" key={task.id}>
+                    <span className={`status-pill status-pill--${task.status}`}>{task.status}</span>
+                    <strong>{task.interface}</strong>
+                    <code>{task.id}</code>
+                    <small>{new Date(task.finished_at).toLocaleString()}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="tool-panel__empty">暂无抓包任务记录。</p>
+            )}
+          </div>
+
+          <div className="result-section">
+            <div className="result-section__head">
+              <h4>pcap 文件</h4>
+              <span className="status-pill">{files.length}</span>
+            </div>
+            {files.length ? (
+              <div className="file-table">
+                {files.map((file) => (
+                  <div className="file-row" key={file.id}>
+                    <strong>{file.filename}</strong>
+                    <span>{`${(file.size_bytes / 1024).toFixed(1)} KB`}</span>
+                    <small>{new Date(file.modified_at).toLocaleString()}</small>
+                    <div className="file-actions">
+                      <a href={`${API_BASE}/tools/capture/files/${encodeURIComponent(file.id)}/download`}>下载</a>
+                      <button onClick={() => deleteFile(file.id)}>删除</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="tool-panel__empty">暂无 pcap 文件。</p>
+            )}
+          </div>
+
+          <div className="result-section">
+            <div className="result-section__head">
+              <h4>操作日志</h4>
+              <span className="status-pill">{logs.length}</span>
+            </div>
+            {logs.length ? (
+              <div className="log-table">
+                {logs.map((log) => (
+                  <div className="log-row" key={log.id}>
+                    <span className={`status-pill status-pill--${log.status}`}>{log.status}</span>
+                    <strong>{log.message}</strong>
+                    <code>{log.action}</code>
+                    <small>{new Date(log.timestamp).toLocaleString()}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="tool-panel__empty">暂无操作日志。</p>
+            )}
+          </div>
 
           <details className="raw-details">
             <summary>查看原始 JSON</summary>
